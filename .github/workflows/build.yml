@@ -1,0 +1,133 @@
+name: build
+
+# Compila o projeto Android a partir de um ZIP com QUALQUER nome.
+# O ZIP é localizado pela extensão .zip na raiz do repositório ou na pasta "source/".
+# Para escolher um ZIP específico, use Actions > build > Run workflow e informe o caminho.
+
+on:
+  workflow_dispatch:
+    inputs:
+      zip_path:
+        description: "Caminho do ZIP no repositório (opcional, qualquer nome). Vazio = detectar automaticamente."
+        required: false
+        default: ""
+  push:
+    paths:
+      - '*.zip'
+      - '*.ZIP'
+      - 'source/*.zip'
+      - 'source/*.ZIP'
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Baixar repositório
+        uses: actions/checkout@v4
+
+      - name: Localizar o ZIP de entrada
+        shell: bash
+        env:
+          ZIP_INPUT: ${{ github.event.inputs.zip_path }}
+        run: |
+          set -euo pipefail
+          if [ -n "${ZIP_INPUT:-}" ]; then
+            if [ ! -f "$ZIP_INPUT" ]; then
+              echo "::error::O arquivo informado em zip_path não existe: $ZIP_INPUT"
+              exit 1
+            fi
+            ZIP="$ZIP_INPUT"
+          else
+            mapfile -t ZIPS < <(find . source -maxdepth 1 -type f -iname '*.zip' 2>/dev/null | sed 's|^\./||' | sort -u)
+            if [ "${#ZIPS[@]}" -eq 0 ]; then
+              echo "::error::Nenhum arquivo .zip encontrado. Coloque o ZIP do projeto na raiz do repositório ou na pasta source/ (qualquer nome)."
+              exit 1
+            fi
+            if [ "${#ZIPS[@]}" -gt 1 ]; then
+              echo "::error::Mais de um ZIP encontrado. Deixe só um, ou rode manualmente o workflow informando zip_path."
+              printf 'Encontrados:\n'; printf ' - %s\n' "${ZIPS[@]}"
+              exit 1
+            fi
+            ZIP="${ZIPS[0]}"
+          fi
+          echo "ZIP selecionado: $ZIP"
+          echo "ZIP_FILE=$ZIP" >> "$GITHUB_ENV"
+
+      - name: Extrair e detectar a raiz do projeto
+        shell: bash
+        run: |
+          set -euo pipefail
+          WORK="$RUNNER_TEMP/work"
+          rm -rf "$WORK"; mkdir -p "$WORK"
+          unzip -q "$GITHUB_WORKSPACE/$ZIP_FILE" -d "$WORK"
+          # raiz = pasta mais rasa que contém settings.gradle(.kts), ignorando lixo de ZIP
+          ROOT=""
+          BEST=9999
+          while IFS= read -r f; do
+            d="$(dirname "$f")"
+            depth="$(echo "$d" | tr -cd '/' | wc -c)"
+            if [ "$depth" -lt "$BEST" ]; then BEST="$depth"; ROOT="$d"; fi
+          done < <(find "$WORK" \( -name 'settings.gradle.kts' -o -name 'settings.gradle' \) -not -path '*/__MACOSX/*' -not -path '*/build/*')
+          if [ -z "$ROOT" ]; then
+            echo "::error::settings.gradle(.kts) não encontrado dentro do ZIP. Conteúdo do ZIP:"
+            ls -la "$WORK"
+            exit 1
+          fi
+          if ! find "$ROOT" -name AndroidManifest.xml -not -path '*/build/*' | grep -q .; then
+            echo "::error::Nenhum AndroidManifest.xml encontrado na raiz detectada: $ROOT"
+            exit 1
+          fi
+          if ! find "$ROOT" \( -name 'build.gradle.kts' -o -name 'build.gradle' \) -not -path '*/build/*' | grep -q .; then
+            echo "::error::Nenhum build.gradle(.kts) encontrado em: $ROOT"
+            exit 1
+          fi
+          echo "Raiz do projeto: $ROOT"
+          echo "PROJECT_ROOT=$ROOT" >> "$GITHUB_ENV"
+
+      - name: Instalar JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Instalar Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.9'
+
+      - name: Aceitar licenças do Android SDK
+        shell: bash
+        run: |
+          SDKM="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-}}/cmdline-tools/latest/bin/sdkmanager"
+          if [ -x "$SDKM" ]; then
+            yes | "$SDKM" --licenses > /dev/null 2>&1 || true
+          else
+            echo "sdkmanager não encontrado; seguindo (o Gradle tentará aceitar as licenças)."
+          fi
+
+      - name: Compilar APK (debug)
+        shell: bash
+        run: |
+          set -euo pipefail
+          gradle -p "$PROJECT_ROOT" assembleDebug --stacktrace
+
+      - name: Reunir APKs
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$GITHUB_WORKSPACE/apk-out"
+          find "$PROJECT_ROOT" -path '*/build/outputs/apk/*' -name '*.apk' -exec cp {} "$GITHUB_WORKSPACE/apk-out/" \;
+          if ! ls "$GITHUB_WORKSPACE"/apk-out/*.apk >/dev/null 2>&1; then
+            echo "::error::A compilação terminou mas nenhum APK foi gerado."
+            exit 1
+          fi
+          ls -la "$GITHUB_WORKSPACE/apk-out"
+
+      - name: Publicar APK como artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: MMDModelStudio-apk
+          path: apk-out/*.apk
+          if-no-files-found: error
+          
